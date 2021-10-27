@@ -1,0 +1,36 @@
+Command line: train_dpsgd.py --precision 16.16 --model resnet --model-size 50 --dataset imagenet --data-dir /home/edhlee/work/imagenet-data --internal-exchange-optimisation-target balanced --ckpts-per-epoch 4 --gradient-accumulation-count 32 --batch-size 1 --replicas 16 --optimiser SGD --max-cross-replica-buffer-size 100000000 --lr-schedule stepped --learning-rate-schedule 0.25,0.5,0.75,0.9 --label-smoothing 0.1 --epochs 100 --enable-half-partials --normalise-input --stable-norm --learning-rate-decay 1 --eight-bit-io --label-smoothing 0.1 --logs-per-epoch 10 --noise-std 2.0 --clipping-threshold 4.0
+
+imagenet
+ResNet-50
+ Group Norm
+  32 groups
+Training
+ Batch Size: 512
+  Gradients accumulated over 32 fwds/bwds passes 
+  Training on 16 replicas 
+ Base Learning Rate: 2**-8
+ Weight Decay: 0.0001
+ Loss Scaling: 128
+ Epochs: 100.0
+SGD
+Stepped LR schedule
+ Warmup: 5 epochs
+ Drops at [0.25, 0.5, 0.75, 0.9]
+ Decay factor 1.0
+Validation
+ Batch Size: 16
+Using Infeeds
+ Max Batches Per Step: 1000
+Device
+ Precision: 16.16
+ IPU
+ POPLAR version 2.1.0 (a779ded864)
+clang version 13.0.0 (55c74230e0d27502fea24dacd7b67700d96f2bcd)
+ lr65-poplar2
+ 2021-10-27 12:04:54.674394
+Logging
+ Name: RN50_bs1x16rx32a_GN32_16.16
+ Saving to ./logs/RN50_bs1x16rx32a_GN32_16.16_v2.1.0_D8T
+Image Size: 224x224
+
+{'model': 'resnet', 'lr_schedule': 'stepped', 'restore_path': None, 'help': False, 'config': None, 'config_path': '/localdata/edhlee/0_copy/dpsgd-cnn/imagenet/configs.yml', 'model_size': 50, 'batch_norm': False, 'group_norm': True, 'groups': 32, 'BN_decay': 0.97, 'dataset': 'imagenet', 'data_dir': '/home/edhlee/work/imagenet-data', 'pipeline_num_parallel': 48, 'generated_data': False, 'synthetic_data': False, 'no_dataset_cache': False, 'normalise_input': True, 'image_size': 224, 'train_with_valid_preprocessing': False, 'hostside_norm': False, 'standard_imagenet': False, 'mixup_alpha': 0.0, 'cutmix_lambda': 1.0, 'cutmix_version': 1, 'hostside_image_mixing': False, 'eight_bit_io': True, 'dataset_percentage_to_use': 100, 'batch_size': 1, 'noise_std': 2.0, 'clipping_threshold': 4.0, 'gradient_accumulation_count': 32, 'base_learning_rate': -8, 'abs_learning_rate': None, 'epochs': 100.0, 'iterations': None, 'weight_decay': 0.0001, 'loss_scaling': 128, 'label_smoothing': 0.1, 'ckpts_per_epoch': 4, 'epochs_per_ckpt': 0, 'ckpt_all_instances': False, 'validation': True, 'shards': 1, 'replicas': 16, 'max_cross_replica_buffer_size': 100000000, 'pipeline': False, 'pipeline_splits': None, 'pipeline_schedule': 'Interleaved', 'optimiser': 'SGD', 'momentum': 0.9, 'rmsprop_decay': None, 'rmsprop_base_decay_exp': None, 'rmsprop_epsilon': 0.001, 'offload_fp32_weight_copy': False, 'variable_filter': [], 'init_path': None, 'distributed': False, 'syncs_per_epoch': 0, 'epochs_per_sync': 0, 'stable_norm': True, 'weight_avg_N': None, 'weight_avg_exp': None, 'lars_epsilon': 0.0, 'lars_skip_list': ['beta', 'gamma', 'bias'], 'lars_weight_decay': 0.0001, 'min_remote_tensor_size': 128, 'lars_eeta': 0.001, 'learning_rate_decay': 1.0, 'learning_rate_schedule': [0.25, 0.5, 0.75, 0.9], 'warmup_epochs': 5, 'precision': '16.16', 'enable_half_partials': True, 'gather_conv_output': False, 'no_stochastic_rounding': False, 'batches_per_step': 1000, 'select_ipu': -1, 'fp_exceptions': False, 'enable_recomputation': False, 'seed': None, 'profile': None, 'dataset_benchmark': False, 'available_memory_proportion': None, 'disable_variable_offloading': False, 'enable_conv_dithering': False, 'internal_exchange_optimisation_target': 'balanced', 'compile_only': False, 'on_demand': False, 'prefetch_depth': None, 'num_io_tiles': 0, 'BN_span': 1, 'saturate_on_overflow': False, 'log_dir': './logs/', 'logs_path': './logs/RN50_bs1x16rx32a_GN32_16.16_v2.1.0_D8T', 'name_suffix': None, 'logs_per_epoch': 10, 'log_freq': 500, 'no_logs': False, 'log_all_instances': None, 'mlperf_logging': False, 'wandb': False, 'wandb_project': 'tf-cnn', 'use_popdist': False, 'total_replicas': 16, 'command': 'train_dpsgd.py --precision 16.16 --model resnet --model-size 50 --dataset imagenet --data-dir /home/edhlee/work/imagenet-data --internal-exchange-optimisation-target balanced --ckpts-per-epoch 4 --gradient-accumulation-count 32 --batch-size 1 --replicas 16 --optimiser SGD --max-cross-replica-buffer-size 100000000 --lr-schedule stepped --learning-rate-schedule 0.25,0.5,0.75,0.9 --label-smoothing 0.1 --epochs 100 --enable-half-partials --normalise-input --stable-norm --learning-rate-decay 1 --eight-bit-io --label-smoothing 0.1 --logs-per-epoch 10 --noise-std 2.0 --clipping-threshold 4.0', 'training': True, 'summary_str': '', 'shortcut_type': 'B', 'warmup': True, 'wd_exclude': ['beta', 'gamma'], 'name': 'RN50_bs1x16rx32a_GN32_16.16', 'distributed_worker_count': 1, 'distributed_worker_index': 0, 'distributed_cluster': None, 'total_batch_size': 512, 'lr_scale': 128, 'grad_scale': 1.0, 'validation_total_batch_size': 16, 'validation_iterations': 3, 'validation_batches_per_step': 1041, 'poplar_version': 'POPLAR version 2.1.0 (a779ded864)\nclang version 13.0.0 (55c74230e0d27502fea24dacd7b67700d96f2bcd)\n', 'hostname': 'lr65-poplar2', 'datetime': '2021-10-27 12:04:54.674394', 'seed_specified': False, 'checkpoint_path': './logs/RN50_bs1x16rx32a_GN32_16.16_v2.1.0_D8T/ckpt'}
