@@ -1,4 +1,4 @@
-# DPSGD-IPU
+
 
 # CNN Training with DP-SGD on IPUs
 
