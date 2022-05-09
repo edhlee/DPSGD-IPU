@@ -20,10 +20,8 @@ class LearningRate:
     def __init__(self, opts, total_iterations):
         self.learning_rate_decay = opts["learning_rate_decay"]
         self.lr_drops = [int(i * total_iterations) for i in opts['learning_rate_schedule']]
-        #self.lr = (2 ** opts["base_learning_rate"]) * opts["total_batch_size"]
-        self.lr = 1.0
+        self.lr = (2 ** opts["base_learning_rate_exponent"]) * opts["total_batch_size"]
         self.next_drop = self.lr_drops.pop(0)
-
         self.warmup_iterations = 0
         if opts['warmup_epochs'] > 0:
             if opts['epochs']:
@@ -35,7 +33,6 @@ class LearningRate:
     def feed_dict_lr(self, iteration):
         if iteration > self.next_drop:
             self.lr *= self.learning_rate_decay
-           
             if len(self.lr_drops) > 0:
                 self.next_drop = self.lr_drops.pop(0)
             else:
@@ -49,11 +46,11 @@ class LearningRate:
 
 def add_arguments(parser):
     lr_group = parser.add_argument_group('Stepped Learning Rate')
-    lr_group.add_argument('--learning-rate-decay', type=float, default=0.1,
+    lr_group.add_argument('--learning-rate-decay', type=float, default=1.0,
                           help="Learning rate decay factor (default 0.1)")
     lr_group.add_argument('--learning-rate-schedule', type=str,
                           help="Learning rate drop points (proportional). Comma Separated (eg. '0.5,0.75')")
-    lr_group.add_argument('--warmup-epochs', type=int, default=5,
+    lr_group.add_argument('--warmup-epochs', type=int, default=0,
                           help="Warmup length in epochs (Default=5, set to 0 for no warmup)")
     return parser
 

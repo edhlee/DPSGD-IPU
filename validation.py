@@ -32,36 +32,71 @@ from collections import OrderedDict
 import importlib
 from glob import glob
 from pathlib import Path
+import threading
 
 import train
 import log as logging
 from Datasets import data as dataset
-from Datasets.imagenet_dataset import fused_accelerator_side_preprocessing
+from Datasets import imagenet_dataset
 from tensorflow.python import ipu
 from ipu_utils import get_config
 from tensorflow.python.ipu.scopes import ipu_scope
-from tensorflow.python.ipu import loops, ipu_infeed_queue
+from tensorflow.python.ipu import loops, ipu_infeed_queue, ipu_outfeed_queue
 import tensorflow.contrib.compiler.xla as xla
 from tensorflow.python.ipu.ops import cross_replica_ops
 from tensorflow.python.ipu import horovod as hvd
 import popdist
 import popdist.tensorflow
 import configurations
+import relative_timer
 
 DATASET_CONSTANTS = dataset.DATASET_CONSTANTS
 MLPERF_EVAL_TARGET = 75.9
 
 
-def validation_graph_builder(model, data_dict, opts):
-    if opts['eight_bit_io']:
-        dtypes = opts["precision"].split('.')
-        input_dtype = tf.float16 if dtypes[0] == '16' else tf.float32
-    if opts['dataset'] == 'imagenet' and not opts['hostside_norm']:
-        data_dict['image'] = fused_accelerator_side_preprocessing(
-            data_dict['image'], opts=opts)
-    elif opts['eight_bit_io']:
-        data_dict['image'] = tf.cast(data_dict['image'], dtype=input_dtype)
+class LatencyThread:
 
+    def __init__(self, valid, total_batches):
+        self.thread = None
+        self.valid = valid
+        self.total_batches = total_batches
+        self.latency_sum = 0.
+        self.start = self.__fake_start
+        self.__start_if_not_compiled = self.__real_start
+
+    def __fake_start(self):
+        pass
+
+    def __real_start(self):
+        self.thread = threading.Thread(target=self.compute_latency)
+        self.thread.start()
+
+    def __setup_real_start(self):
+        self.start = self.__real_start
+        self.__start_if_not_compiled = self.__fake_start
+
+    def join(self):
+        # call to first join indicates compilation complete
+        # call start thread and setup real start
+        self.__start_if_not_compiled()
+        self.__setup_real_start()
+
+        self.thread.join()
+
+    def compute_latency(self):
+        num_batches = 0
+        self.latency_sum = 0
+        while num_batches < self.total_batches:
+            latencies = self.valid.session.run(self.valid.ops['latency_per_batch'])
+            num_batches += latencies.shape[0]
+            self.latency_sum += latencies.sum()
+
+    def get_latency(self):
+        return self.latency_sum/self.total_batches if self.total_batches != 0 else -0.001
+
+
+def validation_graph_builder(model, data_dict, opts):
+    train.ipuside_preprocessing(data_dict, opts, training=False)
     image, label = data_dict['image'], data_dict['label']
     logits = model(opts, training=False, image=image)
     predictions = tf.argmax(logits, 1, output_type=tf.int32)
@@ -80,15 +115,21 @@ def validation_graph(model, opts):
         valid_dataset = dataset.data(opts, is_training=False).map(lambda x: {'data_dict': x})
 
         valid_iterator = ipu_infeed_queue.IPUInfeedQueue(valid_dataset,
-                                                         feed_name='validation_feed',
-                                                         replication_factor=opts['replicas']*opts['shards'],
                                                          prefetch_depth=opts['prefetch_depth'])
+
+        if opts['latency']:
+            timestamp_queue = ipu_outfeed_queue.IPUOutfeedQueue()
 
         with ipu_scope('/device:IPU:0'):
             def comp_fn():
                 def body(total_accuracy, data_dict):
                     accuracy = validation_graph_builder(model, data_dict, opts)
-                    return total_accuracy + (tf.cast(accuracy, tf.float32) / opts["validation_batches_per_step"])
+                    if opts['latency']:
+                        timestamp_enqueue = timestamp_queue.enqueue(data_dict['timestamp'])
+                        return (total_accuracy + (tf.cast(accuracy, tf.float32) / opts["validation_batches_per_step"]),
+                                timestamp_enqueue)
+                    else:
+                        return total_accuracy + (tf.cast(accuracy, tf.float32) / opts["validation_batches_per_step"])
                 accuracy = loops.repeat(int(opts["validation_batches_per_step"]),
                                         body, [tf.constant(0, tf.float32)], valid_iterator)
                 if opts['total_replicas']*opts['shards'] > 1 and not opts.get('inference', False):
@@ -99,17 +140,33 @@ def validation_graph(model, opts):
 
         accuracy = 100 * accuracy
 
+        if opts['latency']:
+            print(f'relative_timer start {relative_timer.get_start()}')
+            timestamp = tf.cast(tf.timestamp() - relative_timer.get_start(), tf.float32)
+            latency_per_batch = tf.reshape(timestamp - timestamp_queue.dequeue(), [-1])
+        else:
+            latency_per_batch = None
+
         valid_saver = tf.train.Saver()
 
         ipu.utils.move_variable_initialization_to_cpu()
         valid_init = tf.global_variables_initializer()
 
         if opts['use_popdist']:
-            broadcast_ops = []
+            broadcast_weights = []
             for var in tf.global_variables():
-                broadcast_ops.append(var.assign(hvd.broadcast(var, root_rank=0)))
+                broadcast_weights.append(var.assign(hvd.broadcast(var, root_rank=0)))
+            total_batch_size_ph = tf.placeholder(dtype=tf.int32, shape=())
+            broadcast_total_batch_size = hvd.broadcast(total_batch_size_ph, root_rank=0)
+            num_files_ph = tf.placeholder(dtype=tf.int32, shape=())
+            broadcast_num_files = hvd.broadcast(num_files_ph, root_rank=0)
+            iteration_ph = tf.placeholder(dtype=tf.int32, shape=())
+            broadcast_iteration = hvd.broadcast(iteration_ph, root_rank=0)
         else:
-            broadcast_ops = None
+            broadcast_weights = None
+            broadcast_total_batch_size, total_batch_size_ph = None, None
+            broadcast_num_files, num_files_ph = None, None
+            broadcast_iteration, iteration_ph = None, None
 
     globalAMP = None
     if opts["available_memory_proportion"] and len(opts["available_memory_proportion"]) == 1:
@@ -125,7 +182,6 @@ def validation_graph(model, opts):
                              conv_dithering=opts["enable_conv_dithering"],
                              enable_recomputation=opts["enable_recomputation"],
                              seed=opts["seed"],
-                             profile = opts['profile'],
                              availableMemoryProportion=globalAMP,
                              stable_norm=opts["stable_norm"],
                              compile_only=opts["compile_only"],
@@ -141,17 +197,30 @@ def validation_graph(model, opts):
         ipu_options = popdist.tensorflow.set_ipu_config(ipu_options, opts['shards'], configure_device=False)
 
     if opts['on_demand']:
-        ipu_options = ipu.utils.set_ipu_connection_type(
-            ipu_options, ipu.utils.DeviceConnectionType.ON_DEMAND, enable_remote_buffers=True)
+        ipu_options.device_connection.enable_remote_buffers = True
+        ipu_options.device_connection.type = ipu.utils.DeviceConnectionType.ON_DEMAND
 
-    ipu.utils.configure_ipu_system(ipu_options)
+    ipu_options.configure_ipu_system()
 
     valid_sess = tf.Session(graph=valid_graph, config=tf.ConfigProto())
 
-    return train.GraphOps(valid_graph, valid_sess, valid_init, [accuracy, broadcast_ops], None, valid_iterator, None, valid_saver, None)
+    ops = {'accuracy': accuracy,
+           'broadcast_weights': broadcast_weights,
+           'broadcast_total_batch_size': broadcast_total_batch_size,
+           'broadcast_num_files': broadcast_num_files,
+           'broadcast_iteration': broadcast_iteration,
+           'latency_per_batch': latency_per_batch}
+
+    placeholders = {'total_batch_size': total_batch_size_ph,
+                    'num_files': num_files_ph,
+                    'iteration': iteration_ph}
+
+    valid_graph.finalize()
+
+    return train.GraphOps(valid_graph, valid_sess, valid_init, ops, placeholders, valid_iterator, None, valid_saver)
 
 
-def validation_run(valid, filepath, i, epoch, first_run, opts):
+def validation_run(valid, filepath, i, epoch, first_run, opts, latency_thread):
     run = True
     if filepath:
         valid.saver.restore(valid.session, filepath)
@@ -173,15 +242,20 @@ def validation_run(valid, filepath, i, epoch, first_run, opts):
     if run:
         if opts['use_popdist']:
             # synchronise the model weights across all instances
-            valid.session.run(valid.ops[1])
+            valid.session.run(valid.ops['broadcast_weights'])
+
         logging.mlperf_logging(key="EVAL_START", log_type="start",
-                               metadata={"epoch_num": epoch})
+                               metadata={"epoch_num": round(epoch)})
         # Gather accuracy statistics
         accuracy = 0.0
-        start = time.time()
+
+        # start latency thread
+        latency_thread.start()
+
+        start = relative_timer.now()
         for __ in range(opts["validation_iterations"]):
             try:
-                a = valid.session.run(valid.ops[0])
+                a = valid.session.run(valid.ops['accuracy'])
             except tf.errors.OpError as e:
                 if opts['compile_only'] and 'compilation only' in e.message:
                     print("Validation graph successfully compiled")
@@ -190,12 +264,16 @@ def validation_run(valid, filepath, i, epoch, first_run, opts):
                 raise tf.errors.ResourceExhaustedError(e.node_def, e.op, e.message)
 
             accuracy += a
-        val_time = time.time() - start
+        val_time = relative_timer.now() - start
         accuracy /= opts["validation_iterations"]
+
+        # wait for all dequeues and latency computation
+        latency_thread.join()
+        latency = latency_thread.get_latency()
 
         valid_format = (
             "Validation top-1 accuracy [{name}] (iteration: {iteration:6d}, epoch: {epoch:6.2f}, img/sec: {img_per_sec:6.2f},"
-            " time: {val_time:8.6f}): {val_acc:6.3f}%")
+            " time: {val_time:8.6f}, latency (ms): {latency:8.4f}: {val_acc:6.3f}%")
 
         val_size = (opts["validation_iterations"] *
                     opts["validation_batches_per_step"] *
@@ -209,16 +287,17 @@ def validation_run(valid, filepath, i, epoch, first_run, opts):
                     ('val_time', val_time),
                     ('val_size', val_size),
                     ('img_per_sec', val_size / val_time),
+                    ('latency', latency * 1000),
                 ])
         logging.print_to_file_and_screen(valid_format.format(**stats), opts)
         logging.write_to_csv(stats, first_run, False, opts)
         if opts["wandb"] and opts["distributed_worker_index"] == 0:
             logging.log_to_wandb(stats)
         logging.mlperf_logging(key="EVAL_STOP", log_type="stop",
-                               metadata={"epoch_num": epoch})
+                               metadata={"epoch_num": round(epoch)})
         logging.mlperf_logging(
             key="EVAL_ACCURACY", value=float(stats["val_acc"])/100,
-            metadata={"epoch_num": epoch})
+            metadata={"epoch_num": round(epoch)})
         return stats
 
 
@@ -229,7 +308,7 @@ def initialise_validation(model, opts):
 
     valid.session.run(valid.iterator.initializer)
     with valid.graph.as_default():
-        valid.session.run(tf.global_variables_initializer())
+        valid.session.run(valid.init)
 
     return valid
 
@@ -270,24 +349,27 @@ def validation_only_process(model, opts):
     num_files = len(filenames)
 
     if opts['use_popdist']:
-        with tf.Graph().as_default(), tf.Session():
-            # synchronise total_batch_size across instances
-            local_tensor = tf.constant(total_batch_size)
-            root_tensor = hvd.broadcast(local_tensor, root_rank=0)
-            total_batch_size = root_tensor.eval()
-
-            # synchronise num_files across instances
-            local_tensor = tf.constant(num_files)
-            root_tensor = hvd.broadcast(local_tensor, root_rank=0)
-            num_files = root_tensor.eval()
+        total_batch_size, num_files = valid.session.run(
+                                            [valid.ops['broadcast_total_batch_size'],
+                                             valid.ops['broadcast_num_files']],
+                                            feed_dict={valid.placeholders['total_batch_size']: total_batch_size,
+                                                       valid.placeholders['num_files']: num_files}
+                                            )
 
     if opts['distributed_worker_index'] == 0:
         print(filenames)
 
+    total_samples = (opts['replicas'] *
+                     opts['shards'] *
+                     opts['validation_batches_per_step'] *
+                     opts["validation_iterations"]
+                     if opts['latency'] else 0)
+
+    latency_thread = LatencyThread(valid, total_samples)
     success = False
     # Validation block
     logging.mlperf_logging(key="BLOCK_START", log_type="start",
-                           metadata={"first_epoch_num": 0,
+                           metadata={"first_epoch_num": 1,
                                      "epoch_count": opts["epochs"]}
                            )
 
@@ -310,26 +392,23 @@ def validation_only_process(model, opts):
             iteration = 0
 
         if opts['use_popdist']:
-            with tf.Graph().as_default(), tf.Session():
-                # synchronise iteration across instances
-                local_tensor = tf.constant(iteration)
-                root_tensor = hvd.broadcast(local_tensor, root_rank=0)
-                iteration = root_tensor.eval()
+            iteration = valid.session.run(valid.ops['broadcast_iteration'],
+                                          feed_dict={valid.placeholders['iteration']: iteration})
 
         epoch = float(total_batch_size * iteration) / DATASET_CONSTANTS[opts['dataset']]['NUM_IMAGES']
         for r in range(opts["repeat"]):
-            stats = validation_run(valid, None, iteration, epoch, i == 0, opts)
+            stats = validation_run(valid, None, iteration, epoch, i == 0, opts, latency_thread)
             # Handle skipped case
             if stats and "val_size" in stats and "val_acc" in stats:
                 if stats["val_acc"] > MLPERF_EVAL_TARGET:
                     success = True
 
     logging.mlperf_logging(key="BLOCK_STOP", log_type="stop",
-                           metadata={"first_epoch_num": 0}
+                           metadata={"first_epoch_num": 1}
                            )
     logging.mlperf_logging(key="RUN_STOP",
                            value={"success": success},
-                           metadata={"epoch_num": epoch,
+                           metadata={"epoch_num": round(epoch),
                                      "status": "success" if success else "aborted"})
 
 

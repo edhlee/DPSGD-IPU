@@ -48,7 +48,7 @@ class IPUOptimizer(optimizer.Optimizer):
     def add_WD(self, grads_and_vars):
         if self._weight_decay != 0.0:
             grads_and_vars = [
-                (grad + (self._weight_decay * var), var) if self._weight_decay_filter_fn(var.name) else (grad, var)
+                (grad + (0.0*self._weight_decay * var), var) if self._weight_decay_filter_fn(var.name) else (grad, var)
                 for grad, var in grads_and_vars]
         return grads_and_vars
 

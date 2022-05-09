@@ -178,6 +178,13 @@ def next_pow_2(x):
     return ans
 
 
+def accelerator_side_preprocessing(image, opts):
+    # To speed up the data input, these steps can be done off-host
+    from Datasets.imagenet_preprocessing import normalise_image
+    image = normalise_image(image, full_normalisation=opts["normalise_input"])
+    return image
+
+
 def fused_accelerator_side_preprocessing(image, opts):
     # To speed up the data input, these steps can be done off-host
     from Datasets.imagenet_preprocessing import fused_normalise_image

@@ -19,9 +19,8 @@ import numpy as np
 class LearningRate:
     """A cosine learning rate schedule with optional warmup."""
     def __init__(self, opts, total_iterations):
-        self.base_lr = 2 ** opts["base_learning_rate"]
-        self.initial_lr = self.base_lr * opts["total_batch_size"] // 100.0
-        self.initial_lr = 0.01
+        self.base_lr = 2 ** opts["base_learning_rate_exponent"]
+        self.initial_lr = self.base_lr * opts["total_batch_size"]
         self.total_iterations = total_iterations
 
         self.warmup_iterations = 0
@@ -43,7 +42,7 @@ class LearningRate:
 
 def add_arguments(parser):
     lr_group = parser.add_argument_group('Cosine Learning Rate')
-    lr_group.add_argument('--warmup-epochs', type=int, default=0,
+    lr_group.add_argument('--warmup-epochs', type=int, default=5,
                           help="Warmup length in epochs (Default=5, set to 0 for no warmup)")
     return parser
 

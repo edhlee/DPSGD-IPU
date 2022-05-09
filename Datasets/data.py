@@ -18,7 +18,7 @@ from . import augmentations
 from . import imagenet_preprocessing
 from functools import partial
 from math import ceil
-import time
+import relative_timer
 
 DATASET_CONSTANTS = {
     'imagenet': {
@@ -125,9 +125,14 @@ def data(opts, is_training=True):
                 if opts['eight_bit_io']:
                     print("Using 8-bit IO between the IPU and host")
                     # mapping the casting -> UINT8 onto the data dictionary
-                    dataset = dataset.map(lambda d: dict(image=tf.cast(d.pop('image'), tf.uint8), **d))
+                    dataset = dataset.map(convert_image_8bit)
                 else:
                     print(f"Using {dtypes[0]}-bit IO between the IPU and host")
+
+                if opts['latency']:
+                    print(f'Timer start {relative_timer.get_start()}')
+                    dataset = dataset.map(add_timestamp)
+
                 return dataset
             else:
                 preprocess_fn = partial(imagenet_preprocess, is_training=training_preprocessing,
@@ -201,7 +206,7 @@ def data(opts, is_training=True):
 
         if is_training and opts['mixup_alpha'] > 0:
             # always assign the mixup coefficients on the host
-            dataset = dataset.map(partial(augmentations.assign_mixup_coefficients, batch_size=parallel_calls,
+            dataset = dataset.map(partial(augmentations.assign_mixup_coefficients, batch_size=batch_size,
                                           alpha=opts['mixup_alpha']))
             if opts['hostside_image_mixing']:
                 dataset = dataset.map(augmentations.mixup_image, num_parallel_calls=parallel_calls)
@@ -213,9 +218,13 @@ def data(opts, is_training=True):
         if opts['eight_bit_io']:
             print("Using 8-bit IO between the IPU and host")
             # mapping the casting -> UINT8 onto the data dictionary
-            dataset = dataset.map(convert_image_8bit, num_parallel_calls=parallel_calls)
+            dataset = dataset.map(convert_image_8bit)
         else:
             print(f"Using {dtypes[0]}-bit IO between the IPU and host")
+
+    if opts['latency']:
+        print(f'Timer start {relative_timer.get_start()}')
+        dataset = dataset.map(add_timestamp)
 
     dataset = dataset.prefetch(16)
 
@@ -224,6 +233,12 @@ def data(opts, is_training=True):
 
 def convert_image_8bit(data_dict):
     data_dict['image'] = tf.cast(data_dict['image'], tf.uint8)
+    return data_dict
+
+
+def add_timestamp(data_dict):
+    data_dict['timestamp'] = tf.cast(tf.timestamp() - relative_timer.get_start(),
+                                     tf.float32)
     return data_dict
 
 
@@ -338,8 +353,8 @@ def add_arguments(parser):
     group.add_argument('--no-dataset-cache', action="store_true",
                        help="Don't cache dataset to host RAM")
     group.add_argument('--normalise-input', action="store_true",
-                       help='''Normalise inputs to zero mean and unit variance.
-                           Default approach just translates [0, 255] image to zero mean. (ImageNet only)''')
+                       help="Normalise inputs to zero mean and unit variance."
+                            "Default approach just translates [0, 255] image to zero mean. (ImageNet only)")
     group.add_argument('--image-size', type=int,
                        help="Size of image (ImageNet only)")
     group.add_argument('--train-with-valid-preprocessing', action="store_true",
@@ -354,19 +369,27 @@ def add_arguments(parser):
                             "proportion of the preprocessed image, and (1 - cutmix_lambda) of another preprocessed "
                             "image. Default=1., which means no cutmix is applied")
     group.add_argument('--cutmix-version', type=int, choices=(1, 2), default=1,
-                       help='Version of cutmix to use.')
+                       help="Version of cutmix to use.")
     group.add_argument('--hostside-image-mixing', action='store_true',
                        help="do mixup/cutmix on the CPU host, not the accelerator")
     group.add_argument('--eight-bit-io', action='store_true',
-                       help='Image transfer from host to IPU in 8-bit format, requires normalisation on the IPU')
+                       help="Image transfer from host to IPU in 8-bit format, requires normalisation on the IPU")
     group.add_argument('--dataset-percentage-to-use', type=int, default=100, choices=range(1, 101),
                        help="Use only a specified percentage of the full dataset for training")
+    group.add_argument('--fused-preprocessing', action='store_true',
+                       help="Use memory-optimized fused operations on the device to perform imagenet preprocessing.")
 
 
     return parser
 
 
 def set_defaults(opts):
+    if opts['fused_preprocessing'] and opts['dataset'] != 'imagenet':
+        print('Fused preprocessing is only available for imagenet dataset. Disabling fused preprocessing')
+        opts['fused_preprocessing'] = False
+    if opts['fused_preprocessing'] and opts['hostside_norm']:
+        print('Fused preprocessing requires IPU-side normalisation, setting to IPU-side normalisation')
+        opts['hostside_norm'] = False
     if opts['hostside_norm'] and opts['eight_bit_io']:
         print("8-bit IO requires IPU-side normalisation, setting to IPU-side normalisation")
         opts['hostside_norm'] = False
@@ -418,6 +441,10 @@ def set_defaults(opts):
                                                                                      os.path.join(default_dir,
                                                                                                   first_training_file)))
             opts['data_dir'] = data_dir
+
+    if opts['synthetic_data'] and opts['latency']:
+        print('latency calculation is incompatible with synthetic data mode. Disabling latency.')
+        opts['latency'] = False
 
     opts['summary_str'] += "{}\n".format(opts['dataset'])
 

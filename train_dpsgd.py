@@ -1,3 +1,4 @@
+
 # Copyright (c) 2019 Graphcore Ltd. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -25,6 +26,7 @@ import math
 import argparse
 import datetime
 import random
+import warnings
 from socket import gethostname
 from collections import deque, OrderedDict, namedtuple
 from contextlib import ExitStack
@@ -56,7 +58,7 @@ import popdist.tensorflow
 from Datasets import augmentations
 import json
 import configurations
-#import dp_opt_v1  as dp_optimizer_vectorized
+from tensorflow.python.ipu.config import SchedulingAlgorithm
 
 
 DATASET_CONSTANTS = dataset.DATASET_CONSTANTS
@@ -71,10 +73,17 @@ GraphOps = namedtuple(
                  'placeholders',
                  'iterator',
                  'outfeed',
-                 'saver',
-                 'profile'])
+                 'saver'])
 
 pipeline_schedule_options = [str(p).split(".")[-1] for p in list(pipelining_ops.PipelineSchedule)]
+
+scheduling_algorith_map = {
+    'choose-best': SchedulingAlgorithm.CHOOSE_BEST,
+    'clustering': SchedulingAlgorithm.CLUSTERING,
+    'post-order': SchedulingAlgorithm.POST_ORDER,
+    'look-ahead': SchedulingAlgorithm.LOOK_AHEAD,
+    'shortest-path': SchedulingAlgorithm.SHORTEST_PATH
+}
 
 
 def integer_labels_to_dense(data_dict, opts, num_classes):
@@ -134,79 +143,24 @@ def calculate_loss(logits, data_dict, opts):
     return loss, cross_entropy, accuracy
 
 
-
-import re
-from tensorflow.python.ops import gen_math_ops
-from tensorflow.python.ops import math_ops
-from tensorflow.python.framework import ops
-
-
 def get_optimizer(opts, lr):
-    if not opts['offload_fp32_weight_copy'] and not opts.get('proxy_norm'):
-        # revert to basic optimizers when possible, while functionally they should be identical
-        # the basic optimizer functions are sometimes targeted directly for performance optimizations
-        SGD = tf.train.GradientDescentOptimizer
-        Momentum = tf.train.MomentumOptimizer
-        RMSProp = tf.train.RMSPropOptimizer
-    else:
-        from optimisers import SGD, Momentum, RMSProp
-        if opts['optimiser'] == 'LARS':
-            raise NotImplementedError('--offload-fp32-weight-copy and --proxy-norm are currently not compatible'
-                                      'with LARS optimizer.')
-        if opts['gradient_accumulation_count'] > 1 and not opts['pipeline']:
-            raise NotImplementedError('--offload-fp32-weight-copy and --proxy-norm are currently not compatible'
-                                      'with GradientAccumulatorV1.')
     opt_kwargs = {}
-    if opts['optimiser'] == 'SGD':
-        
-        pipe_ = True if opts["shards"] > 1 else False
 
-        print(pipe_)
-        
+    effective_batch_size = opts["total_replicas"]*opts["gradient_accumulation_count"]
+    if opts['optimiser'] == 'DPSGD':
+        pipe_ = True if opts["shards"] > 1 else False
         if pipe_:
             import dp_opt_v1_pipeline as dp_optimizer_vectorized
         else:
-            import dp_opt_v1  as dp_optimizer_vectorized
-
+            import dp_opt_v1_fp16  as dp_optimizer_vectorized
         optimizer = dp_optimizer_vectorized.VectorizedDPSGD(
           l2_norm_clip=opts['clipping_threshold'],
-          noise_std=opts['noise_std'], 
-          learning_rate=lr)          # note learning_rate here is nulled / not used (will be fixed0
-
-
-    elif opts['optimiser'] == 'momentum':
-        optimizer = Momentum
-        opt_kwargs = {'momentum': opts['momentum']}
-        logging.mlperf_logging(key="OPT_NAME", value="sgd")
-        logging.mlperf_logging(key="SGD_OPT_MOMENTUM", value=opts['momentum'])
-        logging.mlperf_logging(key="SGD_OPT_WEIGHT_DECAY",
-                               value=opts['weight_decay'])
-        logging.mlperf_logging(key="SGD_OPT_BASE_LEARNING_RATE",
-                               value=opts.get("abs_learning_rate", 0))
-        logging.mlperf_logging(key="SGD_OPT_END_LEARNING_RATE",
-                               value=opts.get("abs_end_learning_rate", 0))
-        logging.mlperf_logging(key="SGD_OPT_LEARNING_RATE_DECAY_POLY_POWER",
-                               value=opts.get("poly_lr_decay_power", 2))
-    elif opts['optimiser'] == 'RMSprop':
-        optimizer = RMSProp
-        opt_kwargs = {'momentum': opts['momentum'],
-                      'decay': opts['rmsprop_decay'],
-                      'epsilon': opts['rmsprop_epsilon']}
-    elif opts['optimiser'] == 'LARS':
-        from tensorflow.contrib.opt.python.training.lars_optimizer import LARSOptimizer
-        optimizer = LARSOptimizer
-        logging.mlperf_logging(key="OPT_NAME", value="lars")
-        opts['lars_skip_list'] += ['batch_norm/moving_']
-        opt_kwargs = {'weight_decay': opts['lars_weight_decay'],
-                      'eeta': opts['lars_eeta'],
-                      'epsilon': opts['lars_epsilon'],
-                      'momentum': opts['momentum'],
-                      'skip_list': opts['lars_skip_list']}
-    else:
-        raise ValueError("Optimizer {} not recognised".format(opts['optimiser']))
-
-#    if opts.get('BN_decay'):
-#        optimizer = add_bn_moving_average_updates(optimizer, momentum=opts.get('BN_decay'))
+          noise_std=opts['noise_mult'],
+          effective_batch_size = opts["total_replicas"]*opts["gradient_accumulation_count"],
+          learning_rate=lr)
+    else:  # other optimizers (Adam can be used)
+        SGD = tf.train.GradientDescentOptimizer
+        optimizer = SGD
 
     if opts.get('proxy_norm'):
         if (opts['model'] == 'efficientnet' and not opts['use_relu']):
@@ -230,7 +184,7 @@ def get_optimizer(opts, lr):
     if opts['offload_fp32_weight_copy']:
         optimizer = make_fp32_optimiser(optimizer)
 
-    #optimizer = optimizer(lr, **opt_kwargs)
+#    optimizer = optimizer(lr, **opt_kwargs)
 
     wd_exclude = opts["wd_exclude"] if "wd_exclude" in opts.keys() else []
     wd_exclude += ['batch_norm/moving_']  # always exclude moving averages from weight decay
@@ -258,22 +212,42 @@ def get_optimizer(opts, lr):
 def calculate_and_apply_gradients(loss, opts=None, learning_rate=None):
     optimizer = get_optimizer(opts, learning_rate / opts['lr_scale'])
     grads_and_vars = optimizer.compute_gradients(loss * opts['loss_scaling'])
+    grads_list = [
+              g if g is not None else tf.zeros_like(v)
+              for (g, v) in grads_and_vars
+          ]
+    grads_flat = tf.nest.flatten(grads_list)
+    squared_l2_norms = [
+              tf.reduce_sum(input_tensor=tf.square(tf.cast(g,tf.float32))) for g in grads_flat
+            ]
+
+    global_norm = tf.sqrt(tf.add_n(squared_l2_norms))
+    global_norm *= opts["gradient_accumulation_count"]
+
     with tf.control_dependencies(tf.get_collection(tf.GraphKeys.UPDATE_OPS)):
-        return learning_rate, optimizer.apply_gradients(grads_and_vars)
+        return learning_rate, optimizer.apply_gradients(grads_and_vars), global_norm
 
 
-def basic_training_step(data_dict, model, opts, learning_rate):
-    """
-    A basic training step that will work on all hardware
-    """
-    if opts["eight_bit_io"]:
-        dtypes = opts["precision"].split('.')
-        data_dict['image'] = tf.cast(data_dict['image'], dtype=tf.float16 if dtypes[0] == '16' else tf.float32)
-
-    if opts['dataset'] == 'imagenet' and not opts['hostside_norm']:
-        data_dict['image'] = imagenet_dataset.fused_accelerator_side_preprocessing(
-            data_dict['image'], opts=opts)
-    if not opts['hostside_image_mixing']:
+def ipuside_preprocessing(data_dict, opts, training=True):
+    if opts['dataset'] == 'imagenet':
+        if opts['fused_preprocessing']:
+            data_dict['image'] = imagenet_dataset.fused_accelerator_side_preprocessing(
+                data_dict['image'], opts=opts)
+        else:
+            if opts['eight_bit_io']:
+                dtypes = opts['precision'].split('.')
+                input_dtype = tf.float16 if dtypes[0] == '16' else tf.float32
+                data_dict['image'] = tf.cast(
+                    data_dict['image'], dtype=input_dtype)
+            if not opts['hostside_norm']:
+                data_dict['image'] = imagenet_dataset.accelerator_side_preprocessing(
+                    data_dict['image'], opts=opts)
+    elif opts['eight_bit_io']:
+        dtypes = opts['precision'].split('.')
+        input_dtype = tf.float16 if dtypes[0] == '16' else tf.float32
+        data_dict['image'] = tf.cast(
+            data_dict['image'], dtype=input_dtype)
+    if not opts['hostside_image_mixing'] and training:
         # apply augmentation on the accelerator
         if opts['mixup_alpha'] > 0.:
             data_dict = augmentations.mixup_image(data_dict)
@@ -281,34 +255,29 @@ def basic_training_step(data_dict, model, opts, learning_rate):
             data_dict = augmentations.cutmix(data_dict, cutmix_lambda=opts['cutmix_lambda'],
                                              cutmix_version=opts['cutmix_version'])
 
+
+def basic_training_step(data_dict, model, opts, learning_rate):
+    """
+    A basic training step that will work on all hardware
+    """
+
+    ipuside_preprocessing(data_dict, opts)
+
     image, label = data_dict['image'], data_dict['label']
     logits = model(opts, training=True, image=image)
     loss, cross_entropy, accuracy = calculate_loss(logits, data_dict, opts)
 
-    learning_rate, train_op = calculate_and_apply_gradients(loss, opts, learning_rate=learning_rate)
+    learning_rate, train_op, grad_norm = calculate_and_apply_gradients(loss, opts, learning_rate=learning_rate)
 
-    return loss, cross_entropy, accuracy, learning_rate, train_op
+    return loss, cross_entropy, accuracy, learning_rate, train_op, grad_norm
 
 
 def basic_pipelined_training_step(model, opts, learning_rate, infeed, outfeed, iterations_per_step=1):
 
-    def first_stage(learning_rate, data_dict, pipeline_stage=None, idx=None):
-        if opts['eight_bit_io']:
-            dtypes = opts['precision'].split('.')
-            input_dtype = tf.float16 if dtypes[0] == '16' else tf.float32
-        if opts['dataset'] == 'imagenet' and not opts['hostside_norm'] and idx == 0:
-            data_dict['image'] = imagenet_dataset.fused_accelerator_side_preprocessing(
-                data_dict['image'], opts=opts)
-        elif opts['eight_bit_io']:
-                data_dict['image'] = tf.cast(
-                    data_dict['image'], dtype=input_dtype)
+    def first_stage(learning_rate, data_dict, pipeline_stage=None):
 
-        if not opts['hostside_image_mixing']:
-            if opts['mixup_alpha'] > 0:
-                data_dict = augmentations.mixup_image(data_dict)
-            if opts['cutmix_lambda'] < 1.:
-                data_dict = augmentations.cutmix(data_dict, cutmix_lambda=opts['cutmix_lambda'],
-                                                 cutmix_version=opts['cutmix_version'])
+        ipuside_preprocessing(data_dict, opts)
+
         image, label = data_dict['image'], data_dict['label']
 
         outputs = [learning_rate, pipeline_stage(image), label]
@@ -342,13 +311,12 @@ def basic_pipelined_training_step(model, opts, learning_rate, infeed, outfeed, i
             return loss, cross_entropy, accuracy, learning_rate / opts["lr_scale"]
 
     model_stages = model(opts)
-    computational_stages = [partial(first_stage, pipeline_stage=model_stages[0], idx=0)]
+    computational_stages = [partial(first_stage, pipeline_stage=model_stages[0])]
     computational_stages += [partial(later_stage, pipeline_stage=model_stages[idx+1],
                                      final_stage=idx == len(model_stages)-2) for idx in range(len(model_stages) - 1)]
 
     def optimizer_function(loss, _, __, lr):
         optimizer = get_optimizer(opts, lr)
-#        optimizer = optimizer
         return pipelining_ops.OptimizerFunctionOutput(optimizer, loss * opts["loss_scaling"])
 
     options = None
@@ -419,8 +387,8 @@ def training_step_with_infeeds_and_outfeeds(train_iterator, outfeed, model, opts
                                 learning_rate=learning_rate)
 
         def training_step_loop(data_dict, outfeed=None):
-            loss, cross_ent, accuracy, lr_out, apply_grads = training_step(data_dict)
-            outfeed = outfeed.enqueue((loss, cross_ent, accuracy, lr_out))
+            loss, cross_ent, accuracy, lr_out, apply_grads, grad_norm = training_step(data_dict)
+            outfeed = outfeed.enqueue((loss, cross_ent, accuracy, lr_out, grad_norm))
             return outfeed, apply_grads
 
         def compiled_fn():
@@ -461,8 +429,6 @@ def create_popdist_strategy():
     Horovod-based IPUMultiReplicaStrategy. Horovod is used for the initial
     broadcast of the weights and when reductions are requested on the host.
     """
-    hvd.init()
-
     # We add the IPU cross replica reductions explicitly in the IPUOptimizer,
     # so disable them in the IPUMultiReplicaStrategy.
     return ipu_multi_replica_strategy.IPUMultiReplicaStrategy(
@@ -484,24 +450,20 @@ def training_graph(model, opts, iterations_per_step=1):
         if strategy:
             stack.enter_context(strategy.scope())
 
-        placeholders = dict()
-        placeholders['learning_rate'] = tf.placeholder(tf.float32, shape=[])
-        learning_rate = placeholders['learning_rate']
+        learning_rate_ph = tf.placeholder(tf.float32, shape=[])
 
         # all data-consuming functions operate on a 'data_dict'
         training_dataset = dataset.data(opts, is_training=True).map(lambda x: {'data_dict': x})
 
         # datasets must be defined outside the ipu device scope
         train_iterator = ipu_infeed_queue.IPUInfeedQueue(training_dataset,
-                                                         feed_name='training_feed',
-                                                         replication_factor=opts['replicas'],
                                                          prefetch_depth=opts['prefetch_depth'])
-        outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue(feed_name="outfeed",
-                                                          replication_factor=opts['replicas'])
+        outfeed_queue = ipu_outfeed_queue.IPUOutfeedQueue()
 
         with ipu_scope('/device:IPU:0'):
             train = training_step_with_infeeds_and_outfeeds(train_iterator, outfeed_queue, model,
-                                                            opts, learning_rate, iterations_per_step)
+                                                            opts, learning_rate_ph, iterations_per_step)
+
         outfeed = outfeed_queue.dequeue()
         ga_factor = opts["gradient_accumulation_count"] if opts['pipeline'] else 1
         if strategy:
@@ -514,10 +476,18 @@ def training_graph(model, opts, iterations_per_step=1):
         logging.print_trainable_variables(opts)
 
         train_saver = tf.train.Saver(max_to_keep=999999)
-        with tf.device('cpu'):
-            profile_report = gen_ipu_ops.ipu_event_trace()
         ipu.utils.move_variable_initialization_to_cpu(graph=None)
         train_init = tf.global_variables_initializer()
+
+        if opts['use_popdist']:
+            broadcast_weights = []
+            for var in tf.global_variables():
+                broadcast_weights.append(var.assign(hvd.broadcast(var, root_rank=0)))
+            iteration_ph = tf.placeholder(dtype=tf.int32, shape=())
+            broadcast_iteration = hvd.broadcast(iteration_ph, root_rank=0)
+        else:
+            broadcast_weights = None
+            broadcast_iteration, iteration_ph = None, None
 
     globalAMP = None
     if opts["available_memory_proportion"] and len(opts["available_memory_proportion"]) == 1:
@@ -539,7 +509,6 @@ def training_graph(model, opts, iterations_per_step=1):
                              conv_output=opts["gather_conv_output"],
                              enable_recomputation=opts["enable_recomputation"],
                              seed=opts["seed"],
-                             profile=opts['profile'],
                              availableMemoryProportion=globalAMP,
                              stable_norm=opts["stable_norm"],
                              internalExchangeOptimisationTarget=opts[
@@ -549,39 +518,47 @@ def training_graph(model, opts, iterations_per_step=1):
                              number_of_distributed_batch_norm_replicas=opts.get("BN_span", 1),
                              min_remote_tensor_size=min_remote_tensor_size,
                              nanoo=not opts["saturate_on_overflow"],
+                             scheduling_algorithm=scheduling_algorith_map[opts['scheduling_algorithm']],
+                             max_reduce_many_buffer_size=opts["max_reduce_many_buffer_size"],
+                             compile_only=opts["compile_only"]
                              )
 
     if opts['use_popdist']:
         ipu_options = popdist.tensorflow.set_ipu_config(ipu_options, opts['shards'], configure_device=False)
 
     if opts['on_demand']:
-        ipu_options = ipu.utils.set_ipu_connection_type(
-            ipu_options, ipu.utils.DeviceConnectionType.ON_DEMAND, enable_remote_buffers=True)
+        ipu_options.device_connection.enable_remote_buffers = True
+        ipu_options.device_connection.type = ipu.utils.DeviceConnectionType.ON_DEMAND
 
-    if opts['compile_only']:
-        ipu_options = ipu.utils.set_ipu_connection_type(
-            ipu_options, ipu.utils.DeviceConnectionType.NEVER, ipu_version=2, enable_remote_buffers=True)
-
-    ipu.utils.configure_ipu_system(ipu_options)
+    ipu_options.configure_ipu_system()
     train_sess = tf.Session(graph=train_graph, config=sess_config, target=sess_target)
 
-    return GraphOps(train_graph, train_sess, train_init, [train], placeholders, train_iterator, outfeed, train_saver,
-                    profile_report)
+    ops = {'train': train,
+           'broadcast_weights': broadcast_weights,
+           'broadcast_iteration': broadcast_iteration}
+
+    placeholders = {'learning_rate': learning_rate_ph,
+                    'iteration': iteration_ph}
+
+    return GraphOps(train_graph, train_sess, train_init, ops, placeholders, train_iterator, outfeed, train_saver)
 
 
 def training_step(train, e, learning_rate):
     # Run Training
     start = time.time()
-    _ = train.session.run(train.ops, feed_dict={train.placeholders['learning_rate']: learning_rate})
+    _ = train.session.run(train.ops['train'], feed_dict={train.placeholders['learning_rate']: learning_rate})
     batch_time = (time.time() - start)
+
     if not os.environ.get('TF_POPLAR_FLAGS') or '--use_synthetic_data' not in os.environ.get('TF_POPLAR_FLAGS'):
-        loss, cross_ent, accuracy, lr_out = train.session.run(train.outfeed)
+        loss, cross_ent, accuracy, lr_out, grad_norm = train.session.run(train.outfeed)
         loss = np.mean(loss)
         accuracy = 100.0 * np.mean(accuracy)
         lr = lr_out.flatten()[-1]
+        grad_norm_ = grad_norm
+        #grad_norm_ = np.sum(grad_norm)
     else:
-        loss, accuracy, lr = 0, 0, 0
-    return loss, accuracy, batch_time, lr
+        loss, accuracy, lr, grad_norm_ = 0, 0, 0,0
+    return loss, accuracy, batch_time, lr, grad_norm_
 
 
 def train_process(model, LR_Class, opts):
@@ -604,6 +581,8 @@ def train_process(model, LR_Class, opts):
     else:
         iterations = opts['iterations']
         log_freq = opts['log_freq']
+        if not opts['epochs']:
+            opts['epochs'] = 1.0 * iterations * opts['total_batch_size'] / DATASET_CONSTANTS[opts['dataset']]['NUM_IMAGES']
 
     if log_freq < opts['batches_per_step']:
         iterations_per_step = log_freq
@@ -617,6 +596,9 @@ def train_process(model, LR_Class, opts):
     else:
         iterations_per_ckpt = (iterations_per_epoch * opts['epochs_per_ckpt']
                                if opts['epochs_per_ckpt'] else np.inf)
+    if iterations_per_ckpt == 0:
+        iterations_per_ckpt = 1
+    ckpt_offset = opts['ckpt_epochs_offset'] * iterations_per_epoch
 
     if type(opts['syncs_per_epoch']) is int:
         iterations_per_sync = (iterations_per_epoch // opts['syncs_per_epoch']
@@ -628,12 +610,15 @@ def train_process(model, LR_Class, opts):
     LR = LR_Class(opts, iterations)
 
     if opts['optimiser'] == 'momentum':
-        warmup_iterations = iterations * opts['warmup_epochs'] // opts['epochs']
+        warmup_iterations = 0
+        if opts['warmup_epochs'] and int(round(opts['epochs'])):
+            warmup_iterations = iterations * opts['warmup_epochs'] // int(round(opts['epochs']))
         decay_steps = iterations - warmup_iterations
         logging.mlperf_logging(key="SGD_OPT_LEARNING_RATE_DECAY_STEPS",
                                value=decay_steps)
 
     batch_accs = deque(maxlen=iterations_per_epoch // iterations_per_step)
+    batch_grad_norms = deque(maxlen=iterations_per_epoch // iterations_per_step)
     batch_losses = deque(maxlen=iterations_per_epoch // iterations_per_step)
     batch_times = deque(maxlen=iterations_per_epoch // iterations_per_step)
     start_all = None
@@ -686,15 +671,10 @@ def train_process(model, LR_Class, opts):
             # only instance 0 accesses the disk to restore the checkpoints, so the value of the most recent iteration
             # is only known to this instance. We use horovod to synchronise the iteration value across the other
             # instances. The same happens to the variable values restored from the latest checkpoint.
-            with tf.Graph().as_default(), tf.Session():
-                local_tensor = tf.constant(i)
-                root_tensor = hvd.broadcast(local_tensor, root_rank=0)
-                i = root_tensor.eval()
-            broadcast_ops = []
-            with train.graph.as_default():
-                for var in tf.global_variables():
-                    broadcast_ops.append(var.assign(hvd.broadcast(var, root_rank=0)))
-                train.session.run(broadcast_ops)
+
+            i = train.session.run(train.ops['broadcast_iteration'],
+                                  feed_dict={train.placeholders['iteration']: i})
+            train.session.run(train.ops['broadcast_weights'])
     else:
         i = 0
 
@@ -703,7 +683,16 @@ def train_process(model, LR_Class, opts):
         print("Saved initial checkpoint to {}".format(filepath))
 
     # single warm up step without weight update or training
-    training_step(train, 0, 0)
+    # Graph gets compiled in here
+    _, _, compilation_time, _,_ = training_step(train, 0, 0)
+
+    logging.print_to_file_and_screen(
+            "Compilation time: {}s.".format(compilation_time), opts)
+
+    # End to avoid any training if compile only mode
+    if opts['compile_only']:
+        print("Training graph successfully compiled")
+        sys.exit(0)
 
     # ------------- TRAINING LOOP ----------------
 
@@ -717,15 +706,15 @@ def train_process(model, LR_Class, opts):
     logging.mlperf_logging(key="RUN_START", log_type="start")
     # Training block
     logging.mlperf_logging(key="BLOCK_START", log_type="start",
-                           metadata={"first_epoch_num": 0,
+                           metadata={"first_epoch_num": 1,
                                      "epoch_count": opts['epochs']},
                            )
     logging.mlperf_logging(key="EPOCH_START", log_type="start",
-                           metadata={'epoch_num': 0})
-    previous_epoch = 0
-    log_epoch = 0
+                           metadata={"epoch_num": 1})
+    log_epoch = 1
     while i < iterations:
-
+        epoch = float(opts['total_batch_size'] * (i + iterations_per_step)) / DATASET_CONSTANTS[opts['dataset']][
+            'NUM_IMAGES']
         if not opts['pipeline']:
             step += opts['gradient_accumulation_count']
         else:
@@ -733,33 +722,34 @@ def train_process(model, LR_Class, opts):
         log_this_step = ((i // log_freq) < ((i + iterations_per_step) // log_freq) or
                          (i == 0) or
                          ((i + (2 * iterations_per_step)) >= iterations))
-        ckpt_this_step = (opts['ckpts_per_epoch'] and
-                          ((i // iterations_per_ckpt) < ((i + iterations_per_step) // iterations_per_ckpt) or
-                          (i == 0) or
-                          ((i + (2 * iterations_per_step)) >= iterations)))
+        ckpt_this_step = (opts['ckpts_per_epoch'] and i >= ckpt_offset - iterations_per_step and
+                          (((i - ckpt_offset) // iterations_per_ckpt) < ((i + iterations_per_step - ckpt_offset) // iterations_per_ckpt) or
+                          ((i + iterations_per_step) >= iterations)))
+        # avoid early checkpointing
+        if ((opts['epochs_per_ckpt'] or opts['ckpts_per_epoch'] == 1) and
+                ckpt_this_step and round(epoch) == opts['epochs'] and
+                (i + iterations_per_step) < iterations):
+            ckpt_this_step = False
+
         valid_this_step = (opts['validation'] and
                            ((i // iterations_per_valid) < ((i + iterations_per_step) // iterations_per_valid) or
-                           (i == 0) or
-                           ((i + (2 * iterations_per_step)) >= iterations)))
+                           ((i + iterations_per_step) >= iterations)))
         sync_this_step = (opts['syncs_per_epoch'] and
                           ((i // iterations_per_sync) < (
                               (i + iterations_per_step) // iterations_per_sync)))
 
-        epoch = float(opts['total_batch_size'] * (i + iterations_per_step)) / DATASET_CONSTANTS[opts['dataset']][
-            'NUM_IMAGES']
-
-        if math.floor(epoch) != math.floor(previous_epoch):
+        # epoch transition logging
+        if math.floor(epoch) == log_epoch and int(round(epoch)) != int(round(opts['epochs'])):
             logging.mlperf_logging(key="EPOCH_STOP", log_type="stop",
                                    metadata={"epoch_num": log_epoch})
-            log_epoch = epoch
-        if math.floor(epoch) != math.floor(previous_epoch) and i < iterations:
-            logging.mlperf_logging(key="EPOCH_START", log_type="start",
-                                   metadata={"epoch_num": epoch})
-        previous_epoch = epoch
+            log_epoch = round(epoch) + 1
+            if i + iterations_per_step < iterations:
+                logging.mlperf_logging(key="EPOCH_START", log_type="start",
+                                       metadata={"epoch_num": log_epoch})
 
         # Run Training
         try:
-            batch_loss, batch_acc, batch_time, current_lr = training_step(train, i + 1, LR.feed_dict_lr(i))
+            batch_loss, batch_acc, batch_time, current_lr, grad_norm_batch = training_step(train, i + 1, LR.feed_dict_lr(i))
             if opts['pipeline']:
                 current_lr *= opts['lr_scale']
         except tf.errors.OpError as e:
@@ -769,6 +759,7 @@ def train_process(model, LR_Class, opts):
 
         # Calculate Stats
         batch_accs.append([batch_acc])
+        batch_grad_norms.append([grad_norm_batch])
         batch_losses.append([batch_loss])
 
         if i != 0:
@@ -778,7 +769,7 @@ def train_process(model, LR_Class, opts):
         if log_this_step:
             train_acc = np.mean(batch_accs)
             train_loss = np.mean(batch_losses)
-
+            train_grad_norm = np.mean(batch_grad_norms)
             if len(batch_times) != 0:
                 avg_batch_time = np.mean(batch_times)
             else:
@@ -796,6 +787,7 @@ def train_process(model, LR_Class, opts):
                 ('lr', current_lr),
                 ('loss_batch', batch_loss),
                 ('loss_avg', train_loss),
+                ('grad_norm', train_grad_norm),
                 ('train_acc_batch', batch_acc),
                 ('train_acc_avg', train_acc),
                 ('it_time', avg_batch_time),
@@ -834,22 +826,20 @@ def train_process(model, LR_Class, opts):
         # Eval
         # only instance 0 loads checkpoints from disk during validation
         if valid_this_step and opts['validation'] and opts['distributed_worker_index'] == 0:
-            validation_points.append((i + iterations_per_step, epoch, i == 0, filepath))
+            validation_points.append((i + iterations_per_step, epoch, i <= iterations_per_valid, filepath))
 
-        # ------------ COLLECT PROFILE -----------
-        # only instance 0 writes the tf profile to disk
-        if opts['profile'] and i == 0 and opts['distributed_worker_index'] == 0:
-            from gcprofile import save_tf_report
-            save_tf_report(train.session.run(train.profile))
         i += iterations_per_step
+        if round(epoch) == opts['epochs'] and i >= iterations:
+            logging.mlperf_logging(key="EPOCH_STOP", log_type="stop",
+                                   metadata={"epoch_num": log_epoch})
 
     logging.mlperf_logging(key="BLOCK_STOP", log_type="stop",
-                           metadata={"first_epoch_num": 0}
+                           metadata={"first_epoch_num": 1}
                            )
 
     # only instance 0 loads checkpoints from disk during weight averaging
     if (opts['weight_avg_N'] or opts['weight_avg_exp']) and opts['distributed_worker_index'] == 0:
-        _ckpts = ckpts[:-1]  # discard final checkpoint as the final 2 are practically identical
+        _ckpts = ckpts
         final_iteration, final_epoch = _ckpts[-1][:2]
         if opts['weight_avg_N']:
             for N in opts['weight_avg_N']:
@@ -872,21 +862,24 @@ def train_process(model, LR_Class, opts):
     if len(validation_points) > 0 and opts['validation']:
         # Validation block
         logging.mlperf_logging(key="BLOCK_START", log_type="start",
-                               metadata={"first_epoch_num": 0,
+                               metadata={"first_epoch_num": 1,
                                          "epoch_count": opts['epochs']}
                                )
         # -------------- BUILD VALIDATION GRAPH ----------------
         valid = validation.initialise_validation(model, opts)
 
+        total_samples = 0  # disable latency calculation
+        latency_thread = validation.LatencyThread(valid, total_samples)
+
         # ------------ RUN VALIDATION ------------
         for iteration, epoch, first_run, filepath in validation_points:
-            stats = validation.validation_run(valid, filepath, iteration, epoch, first_run, opts)
+            stats = validation.validation_run(valid, filepath, iteration, epoch, first_run, opts, latency_thread)
             # Handle skipped case
             if stats and "val_size" in stats and "val_acc" in stats:
                 if stats['val_acc'] > MLPERF_EVAL_TARGET:
                     success = True
         logging.mlperf_logging(key="BLOCK_STOP", log_type="stop",
-                               metadata={"first_epoch_num": 0}
+                               metadata={"first_epoch_num": 1}
                                )
         logging.mlperf_logging(key="RUN_STOP",
                                value={"success": success},
@@ -917,18 +910,20 @@ def set_main_defaults(opts):
 
 def add_training_arguments(parser):
     tr_group = parser.add_argument_group('Training')
-    tr_group.add_argument('--batch-size', type=int,
-                          help="Set batch-size for training graph")
-    tr_group.add_argument('--noise-std', type=float, default=0.00,
+
+    tr_group.add_argument('--noise-mult', type=float, default=0.00,
                           help="Set noise energy for dpsgd")
     tr_group.add_argument('--clipping-threshold', type=float, default=100.0,
                           help="Set clipping threshold for dpsgd")
 
+
+    tr_group.add_argument('--batch-size', type=int,
+                          help="Set batch-size for training graph")
     tr_group.add_argument('--gradient-accumulation-count', type=int, default=1,
                           help="""Number of gradients to accumulate before doing a weight update.
                                 When using pipelining this is the number of times each pipeline stage
                                 will be executed.""")
-    tr_group.add_argument('--base-learning-rate', type=float,
+    tr_group.add_argument('--base-learning-rate-exponent', type=float,
                           help="Base learning rate exponent (2**N). blr = lr /  bs")
     tr_group.add_argument('--abs-learning-rate', type=float,
                           help="Absolute learning rate, if value not specified the base learning rate is used.")
@@ -947,6 +942,8 @@ def add_training_arguments(parser):
                           help="Checkpoints per epoch")
     tr_group.add_argument('--epochs-per-ckpt', type=int, default=0,
                           help="Epochs per checkpoint. Overwrites --ckpts-per-epoch")
+    tr_group.add_argument('--ckpt-epochs-offset', type=int, default=0,
+                          help="Epoch offset when checkpointing starts.")
     tr_group.add_argument('--ckpt-all-instances', type=bool, default=False,
                           help="""Allow all instances to create a checkpoint.
                                 By default only instance 0 does checkpointing""")
@@ -968,7 +965,7 @@ def add_training_arguments(parser):
     tr_group.add_argument('--pipeline-schedule', type=str, default="Interleaved",
                           choices=pipeline_schedule_options,
                           help="Pipelining schedule. Choose between 'Interleaved', 'Grouped' and 'Sequential'.")
-    tr_group.add_argument('--optimiser', type=str, default="SGD", choices=['SGD', 'RMSprop', 'momentum', 'LARS'],
+    tr_group.add_argument('--optimiser', type=str, default="SGD", choices=['DPSGD', 'SGD'],
                           help="Optimiser")
     tr_group.add_argument('--momentum', type=float, default=0.9,
                           help="Momentum coefficient")
@@ -1026,7 +1023,7 @@ def set_training_defaults(opts):
         opts['summary_str'] += "  Gradients accumulated over {gradient_accumulation_count} fwds/bwds passes \n"
     if opts['replicas'] > 1:
         opts['summary_str'] += "  Training on {replicas} replicas \n"
-    opts['summary_str'] += (" Base Learning Rate: 2**{base_learning_rate}\n"
+    opts['summary_str'] += (" Base Learning Rate: 2**{base_learning_rate_exponent}\n"
                             " Weight Decay: {weight_decay}\n"
                             " Loss Scaling: {loss_scaling}\n")
     if opts["iterations"]:
@@ -1035,7 +1032,7 @@ def set_training_defaults(opts):
         opts['summary_str'] += " Epochs: {epochs}\n"
 
     if opts['abs_learning_rate'] is not None:
-        opts['base_learning_rate'] = math.log(opts['abs_learning_rate'] / opts['total_batch_size'], 2.0)
+        opts['base_learning_rate_exponent'] = math.log(opts['abs_learning_rate'] / opts['total_batch_size'], 2.0)
 
     if opts['rmsprop_base_decay_exp'] is not None:
         if opts['rmsprop_decay'] is None:
@@ -1086,7 +1083,8 @@ def add_ipu_arguments(parser):
     group.add_argument('--precision', type=str, default="16.16", choices=["16.16", "16.32", "32.32"],
                        help="Precision of Ops(weights/activations/gradients) and Master data types: 16.16, 16.32, 32.32")
     group.add_argument('--enable-half-partials', action="store_true", default=False,
-                       help="Use half (float16) partials for both convolutions and matmuls.")
+                       help="Use half (float16) partials for both convolutions and matmuls. This option will be ignored "
+                       "if enabled and precision is set to 32.32 as half partials are incompatible with float32 training.")
     group.add_argument('--gather-conv-output', action="store_true", default=False,
                        help="Reduce sync cost of small sized all-reduces. Useful when paired with distributed batch norm")
     group.add_argument('--no-stochastic-rounding', action="store_true",
@@ -1100,9 +1098,7 @@ def add_ipu_arguments(parser):
     group.add_argument('--enable-recomputation', action="store_true",
                        help="Allow recomputation of activations required on the backward pass, which redueces memory used at cost of extra computation")
     group.add_argument('--seed', default=None, help="Seed for randomizing training")
-    group.add_argument('--gc-profile', type=str, dest='profile', nargs='?', action='store', default=None,
-                       const="IPU_PROFILE", choices=["DEVICE_PROFILE", "IPU_PROFILE", "TILE_PROFILE", "NO_PROFILE"],
-                       help="Generate profile reprts")
+    group.add_argument('--identical-replica-seeding', action="store_true", default=False, help="Seed all replicas with the same seed")
     group.add_argument('--dataset-benchmark', action="store_true", default=False, help="Benchmark dataset")
     group.add_argument('--available-memory-proportion', default=None, nargs='+',
                        help="Proportion of memory which is available for convolutions. Use a value of less than 0.6 "
@@ -1127,8 +1123,14 @@ def add_ipu_arguments(parser):
                        help="Number of replicas used for distributed batch norm "
                             "(power of 2, lower or equal to the number of replicas). "
                             "Default: 1.")
+    group.add_argument("--max-reduce-many-buffer-size", type=int, default=0,
+                       help="Maximum reduceMany buffer size.")
     group.add_argument('--saturate-on-overflow', action="store_true",
                        help="Saturate to the max value instead returning NaN for float16")
+    group.add_argument('--latency', action='store_true',
+                       help="calculate batch latency.")
+    group.add_argument('--scheduling-algorithm', type=str, default='choose-best',
+                       choices=scheduling_algorith_map.keys())
     return parser
 
 
@@ -1174,6 +1176,7 @@ def set_ipu_defaults(opts):
     opts['summary_str'] += 'Device\n'
     opts['summary_str'] += ' Precision: {}{}\n'.format(opts['precision'],
                                                        '_noSR' if opts['no_stochastic_rounding'] else '')
+    opts['summary_str'] += ' Half partials: {}\n'.format(False if opts['precision'] == '32.32' else opts['enable_half_partials'])
     opts['summary_str'] += ' IPU\n'
     opts['poplar_version'] = os.popen('popc --version').read()
     opts['summary_str'] += ' {poplar_version}'
@@ -1190,6 +1193,18 @@ def set_ipu_defaults(opts):
         opts['seed'] = seed
     else:
         opts['seed_specified'] = False
+
+    if opts['identical_replica_seeding']:
+        # If an explicit seed was specified, randint has already been seeded.
+        identical_seed = random.randint(-2**16, 2**16 - 1)
+
+        # Make sure the seed is the same across instances.
+        if opts['use_popdist']:
+            with tf.Graph().as_default(), tf.Session():
+                identical_seed = hvd.broadcast(
+                    identical_seed, root_rank=0, name="broadcast_seed").eval()
+
+        reset_ipu_seed(identical_seed, experimental_identical_replicas=True)
 
     opts['summary_str'] += (' {hostname}\n'
                             ' {datetime}\n')
@@ -1225,11 +1240,6 @@ def set_defaults(model, LR, opts):
     validation.set_validation_defaults(opts)
     set_ipu_defaults(opts)
     logging.set_defaults(opts)
-
-
-def set_profiling_opts(opts):
-    if opts["profile"]:
-        opts["summary_str"] += 'A profiling session is run, the report will be retrieved for the first iteration'
 
 
 if __name__ == '__main__':
@@ -1271,6 +1281,9 @@ if __name__ == '__main__':
                 raise ValueError(
                     '--available-memory-proportion should have either one value or 2*shards values specified')
 
+        if opts['enable_half_partials'] and opts['precision'] == '32.32':
+            warnings.warn('Half partials are incompatible with float32 training, so the option will be ignored.')
+
         if opts['shards'] > 1 and opts['pipeline'] is False:
             raise ValueError('--shards should be used in combination with --pipeline.')
 
@@ -1280,9 +1293,12 @@ if __name__ == '__main__':
             raise ValueError('--pipeline-splits should be used in combination with --pipeline.')
 
         if popdist.isPopdistEnvSet():
+            hvd.init()
             opts['use_popdist'] = True
             opts['replicas'] = popdist.getNumLocalReplicas()
             opts['total_replicas'] = popdist.getNumTotalReplicas()
+            if not opts['compile_only']:
+                opts['select_ipu'] = str(popdist.getDeviceId())
         else:
             opts['use_popdist'] = False
             opts['total_replicas'] = opts['replicas']
@@ -1329,7 +1345,6 @@ if __name__ == '__main__':
             opts['image_size'] = 32
         if opts['wandb'] and opts['distributed_worker_index'] == 0:
             logging.initialise_wandb(opts)
-        set_profiling_opts(opts)
         logging.print_to_file_and_screen("Command line: " + opts['command'], opts)
         logging.print_to_file_and_screen(opts['summary_str'].format(**opts), opts)
         opts['summary_str'] = ""

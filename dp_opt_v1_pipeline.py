@@ -53,7 +53,7 @@ def make_vectorized_optimizer_class(cls):
     def __init__(
         self,
         l2_norm_clip,
-        noise_std, #use_pipeline,
+        noise_std, effective_batch_size, #use_pipeline,
         *args,  # pylint: disable=keyword-arg-before-vararg, g-doc-args
         **kwargs):
       """Initialize the DPOptimizerClass.
@@ -67,7 +67,8 @@ def make_vectorized_optimizer_class(cls):
       """
       super(DPOptimizerClass, self).__init__(*args, **kwargs)
       self._l2_norm_clip = l2_norm_clip
-      self._noise_std = noise_std
+      self._effective_batch_size = effective_batch_size
+      self._noise_std = noise_std * self._l2_norm_clip/np.sqrt(self._effective_batch_size),
     def compute_gradients(self,
                           loss,
                           var_list,
@@ -86,13 +87,11 @@ def make_vectorized_optimizer_class(cls):
 
 
         self._num_microbatches = 1
-
         microbatch_losses = tf.reshape(loss, [self._num_microbatches, -1])
         if var_list is None:
           var_list = (
               tf.trainable_variables() + tf.get_collection(
                   tf.GraphKeys.TRAINABLE_RESOURCE_VARIABLES))
-        print("var_list", var_list)
         grads, var_list = zip(*super(DPOptimizerClass, self).compute_gradients(
               microbatch_losses,
               var_list,

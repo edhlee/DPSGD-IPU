@@ -207,36 +207,34 @@ def mb_conv_block_funs(
             x = activation(x)
             return x
 
-    def mb_conv_b(input, name=name + "/b"):
+    def mb_conv_b(input, has_se=True, name=name + "/b"):
         with tf.variable_scope(name):
             # Depthwise Convolution
             x = depthwise_conv(input, kernel_size, stride, filters_out=intermediate_filters)
             x = norm(x)
             if proxy_norm:
                 x, inv_proxy_std = activation(x, delay_scale=True)  # delay proxy scaling for efficiency
-                return [x, inv_proxy_std]
             else:
                 x = activation(x)
-                return [x, 1]
 
-    def mb_conv_SE(inputs, name=name + "/SE"):
-        input, inv_proxy_std = inputs  # note that inv_proxy_std=1 if proxy_norm=False
-        with tf.variable_scope(name):
-            num_reduced_filters = max(1, int(in_filters * se_ratio))
-            se_tensor = tf.reduce_mean(input, reduction_indices=[1, 2], keep_dims=True)
-            with tf.variable_scope("1"):
-                se_tensor = conv(se_tensor, 1, 1, num_reduced_filters, bias=True)
-            if proxy_norm:
-                se_tensor = activation(se_tensor, proxy_norm=False)
-            else:
-                se_tensor = activation(se_tensor)
-            with tf.variable_scope("2"):
-                se_tensor = conv(se_tensor, 1, 1, intermediate_filters, bias=True)
-            se_tensor = tf.math.sigmoid(se_tensor)
-            if proxy_norm:
-                se_tensor = se_tensor * inv_proxy_std  # do proxy scaling here for efficiency
-            x = tf.math.multiply(input, se_tensor)
-            return x
+        if has_se:
+            with tf.variable_scope(name[:-1] + "SE"):
+                num_reduced_filters = max(1, int(in_filters * se_ratio))
+                se_tensor = tf.reduce_mean(x, reduction_indices=[1, 2], keep_dims=True)
+                with tf.variable_scope("1"):
+                    se_tensor = conv(se_tensor, 1, 1, num_reduced_filters, bias=True)
+                if proxy_norm:
+                    se_tensor = activation(se_tensor, proxy_norm=False)
+                else:
+                    se_tensor = activation(se_tensor)
+                with tf.variable_scope("2"):
+                    se_tensor = conv(se_tensor, 1, 1, intermediate_filters, bias=True)
+                se_tensor = tf.math.sigmoid(se_tensor)
+                if proxy_norm:
+                    se_tensor = se_tensor * inv_proxy_std  # do proxy scaling here for efficiency
+                x = tf.math.multiply(x, se_tensor)
+
+        return x
 
     def mb_conv_c(input, name=name + "/c"):
         with tf.variable_scope(name):
@@ -250,9 +248,7 @@ def mb_conv_block_funs(
         x = x_in
         if expand_ratio != 1:
             x = mb_conv_a(x)
-        x = mb_conv_b(x)
-        if has_se:
-            x = mb_conv_SE(x)
+        x = mb_conv_b(x, has_se=has_se)
         x = mb_conv_c(x)
         if survival_prob > 0 and survival_prob < 1:
             x = drop_connect(x, is_training, survival_prob)
@@ -267,9 +263,7 @@ def mb_conv_block_funs(
     else:
         if expand_ratio != 1:
             fn_list += [partial(mb_conv_a, name=name)]
-        fn_list += [partial(mb_conv_b, name=name + "/b")]
-        if has_se:
-            fn_list += [partial(mb_conv_SE, name=name + "/SE")]
+        fn_list += [partial(mb_conv_b, has_se=has_se, name=name + "/b")]
         fn_list += [partial(mb_conv_c, name=name + "/c")]
 
     return fn_list
@@ -514,13 +508,13 @@ def set_defaults(opts):
             opts["weight_decay"] = wd_default
         if opts.get("lars_weight_decay") is None:
             opts["lars_weight_decay"] = 1e-5
-        if not opts.get('base_learning_rate'):
+        if not opts.get('base_learning_rate_exponent'):
             if opts['optimiser'] == 'SGD':
-                opts['base_learning_rate'] = -7.0
+                opts['base_learning_rate_exponent'] = -7.0
             elif opts['optimiser'] == 'momentum':
-                opts['base_learning_rate'] = -10.0
+                opts['base_learning_rate_exponent'] = -10.0
             elif opts['optimiser'] == 'RMSprop':
-                opts['base_learning_rate'] = -14.0
+                opts['base_learning_rate_exponent'] = -14.0
         if opts['optimiser'] == 'RMSprop' and opts['rmsprop_base_decay_exp'] is None:
             opts['rmsprop_base_decay_exp'] = -14.0
         if not opts.get('epochs') and not opts.get('iterations'):
@@ -557,8 +551,8 @@ def set_defaults(opts):
             opts["weight_decay"] = wd_default
         if opts.get("lars_weight_decay") is None:
             opts["lars_weight_decay"] = 1e-6
-        if not opts.get('base_learning_rate'):
-            opts['base_learning_rate'] = -6
+        if not opts.get('base_learning_rate_exponent'):
+            opts['base_learning_rate_exponent'] = -6
         if not opts.get('epochs') and not opts.get('iterations'):
             opts['epochs'] = 300
         if opts.get('lr_schedule') == 'stepped':

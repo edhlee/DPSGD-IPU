@@ -41,7 +41,7 @@ from __future__ import print_function
 import tensorflow as tf
 from tensorflow.python import ipu
 
-# FROM https://github.com/tensorflow/models/blob/master/official/vision/image_classification/resnet/imagenet_preprocessing.py
+# FROM https://github.com/tensorflow/models/blob/r2.6.0/official/vision/image_classification/resnet/imagenet_preprocessing.py
 
 NUM_CLASSES = 1000
 
@@ -392,10 +392,12 @@ def preprocess_image(image_buffer, bbox, output_height, output_width,
     Returns:
       A preprocessed image.
     """
+    out_size = 224
+#    output_height = output_width =  128 
     if is_training:
         # For training, we want to randomize some of the distortions.
         image = _decode_crop_and_flip(image_buffer, bbox, num_channels, seed)
-        image = _resize_image(image, output_height, output_width)
+        image = _resize_image(image, out_size,out_size)
     else:
         # For validation, we want to decode, resize, then just crop the middle.
         image = tf.image.decode_jpeg(image_buffer, channels=num_channels)
@@ -404,9 +406,13 @@ def preprocess_image(image_buffer, bbox, output_height, output_width,
         # prescribed image size.
         _RESIZE_MIN = int(output_height * float(256) / float(224))
         image = _aspect_preserving_resize(image, _RESIZE_MIN)
-        image = _central_crop(image, output_height, output_width)
+        #image = _resize_image(image, 140, 140)
+        image = _central_crop(image, 224, 224)
+        if False:
+          image = _resize_image(image, out_size, out_size)
 
-    image.set_shape([output_height, output_width, num_channels])
+#    image.set_shape([output_height, output_width, num_channels])
+    image.set_shape([out_size, out_size, num_channels])
 
     if full_normalisation is None:
         print("\nImage normalisation will be performed on the IPU.\n")
